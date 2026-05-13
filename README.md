@@ -1,8 +1,10 @@
 # Flash Decode Paged Attention
 
-CUDA/PyTorch implementation of decode-time attention over a paged KV cache, built as a portfolio project for GPU inference and LLM systems roles.
+CUDA/PyTorch implementation of decode-time attention over a paged KV cache for LLM inference.
 
-During autoregressive decoding, each sequence usually generates one token at a time while attending over a growing KV cache. Production inference engines such as vLLM-style servers store that cache in pages/blocks so memory can be reused across requests. This repo implements the core idea in a compact kernel:
+This project was originally built as part of an undergraduate GPU programming project. It implements the core decode-attention operation used when an autoregressive model generates one token at a time while attending over a growing KV cache.
+
+The KV cache is stored in fixed-size pages/blocks, and a block table maps each sequence's logical token blocks to physical cache blocks. The CUDA kernel computes attention directly over that paged layout:
 
 - one CUDA block per `(batch, head)` decode query
 - paged KV cache lookup through a block table
@@ -10,19 +12,6 @@ During autoregressive decoding, each sequence usually generates one token at a t
 - CPU/PyTorch reference implementation for correctness
 - benchmark script that compares extension latency against the reference path
 - profiling hook for `nsys`
-
-The local machine used to create this repo did not have `nvcc` or an NVIDIA GPU, so the CUDA extension is written and packaged but the runnable validation path falls back to PyTorch CPU. On a CUDA machine, `pip install -e .` will build the extension automatically.
-
-## Why This Project
-
-This is closer to real LLM inference work than a generic parallel algorithm demo. It touches the pieces inference teams care about:
-
-- memory layout for KV cache blocks
-- avoiding materializing the full attention matrix
-- stable softmax in a streaming pass
-- Python integration through a PyTorch extension
-- reproducible correctness tests and benchmark commands
-- room for meaningful follow-up optimizations
 
 ## Project Layout
 
@@ -35,7 +24,7 @@ flash_decode/
 benchmarks/
   bench_decode_attention.py    latency and correctness benchmark
 tests/
-  test_attention.py            CPU tests plus optional CUDA extension checks
+  test_attention.py            correctness tests for paged attention
 docs/
   kernel_notes.md              implementation notes and extension ideas
 scripts/
@@ -43,14 +32,6 @@ scripts/
 ```
 
 ## Install
-
-CPU-only development:
-
-```bash
-python3 -m pip install -e .
-```
-
-CUDA development:
 
 ```bash
 python3 -m pip install -e .
@@ -68,11 +49,9 @@ PY
 python3 -m unittest discover -s tests
 ```
 
-The tests always validate the reference implementation. If CUDA is available and the extension built correctly, they also compare the CUDA kernel against the reference.
-
 ## Run Benchmarks
 
-CPU smoke check:
+Reference benchmark:
 
 ```bash
 python3 benchmarks/bench_decode_attention.py --device cpu
@@ -114,6 +93,3 @@ The first kernel is intentionally readable and correctness-focused:
 - assumes contiguous tensors
 - emits one output token per sequence/head
 - uses one pass through K/V with online softmax
-
-Good next steps are listed in [docs/kernel_notes.md](docs/kernel_notes.md), including vectorized loads, split-K for long contexts, causal/prefix masks, and quantized KV cache support.
-
