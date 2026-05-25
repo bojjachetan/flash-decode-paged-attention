@@ -1,63 +1,126 @@
 # Kernel Notes
 
-## Problem
+## Operation
 
-Decode attention computes one output token per active sequence and head:
+Decode attention computes one output token per active sequence and attention head:
 
 ```text
 softmax(q @ K_cache.T / sqrt(head_dim)) @ V_cache
 ```
 
-The interesting inference detail is the KV cache layout. Instead of storing every request in a single dense `[batch, heads, seq, dim]` slab, serving systems keep token blocks in a shared cache and use a block table to map each logical sequence block to a physical cache block.
+The CUDA kernel computes this directly over a paged KV cache. It does not build a dense `[seq_len]` score vector or a `[seq_len, head_dim]` temporary attention matrix.
 
-This project models that layout as:
+## Thread and Block Mapping
+
+The kernel launch uses a 2D grid:
 
 ```text
-k_cache:      [num_blocks, heads, block_size, head_dim]
-v_cache:      [num_blocks, heads, block_size, head_dim]
-block_tables: [batch, max_blocks_per_sequence]
-seq_lens:     [batch]
-q:            [batch, heads, head_dim]
-out:          [batch, heads, head_dim]
+grid.x = batch
+grid.y = heads
 ```
 
-## Current Algorithm
-
-Each CUDA block owns one `(batch, head)` pair. Threads map to head dimensions. For every cached token, the block:
-
-1. computes `q dot k[token]` using a block reduction
-2. updates a numerically stable online softmax state
-3. streams the corresponding `v[token]` into the output accumulator
-
-The online softmax update avoids storing all attention scores:
+Each CUDA block owns one `(batch, head)` decode query:
 
 ```text
-new_m = max(old_m, score)
-alpha = exp(old_m - new_m)
-beta = exp(score - new_m)
+blockIdx.x -> batch index b
+blockIdx.y -> head index h
+threadIdx.x -> feature dimension work
+```
+
+The query vector `q[b, h, :]` is loaded into shared memory once. Then the CUDA block streams through the sequence tokens, resolving each token through the block table:
+
+```text
+logical_block = token / block_size
+block_offset  = token - logical_block * block_size
+physical_block = block_tables[b, logical_block]
+cache_offset = (((physical_block * heads + h) * block_size + block_offset) * head_dim)
+```
+
+## Dot Product Reduction
+
+For each cached token, every thread handles one or more dimensions of the `q dot k` computation. The current implementation supports `head_dim <= 256`, so a 256-thread block can cover common head sizes directly.
+
+The partial products are reduced with warp shuffles and a small shared-memory cross-warp reduction:
+
+```text
+partial_dot = q_shared[dim] * k_cache[token, dim]
+dot = block_reduce_sum(partial_dot)
+score = dot / sqrt(head_dim)
+```
+
+This keeps the reduction inside the CUDA block and avoids global-memory scratch space.
+
+## Online Softmax
+
+A direct implementation would store all scores, run softmax, then multiply by V:
+
+```text
+scores[t] = q dot k[t]
+probs = softmax(scores)
+out = sum_t probs[t] * v[t]
+```
+
+The kernel instead uses online softmax. It keeps three running values:
+
+```text
+m   = running maximum score
+sum = running softmax denominator
+acc = running output accumulator
+```
+
+For a new score `s`:
+
+```text
+new_m = max(m, s)
+alpha = exp(m - new_m)
+beta  = exp(s - new_m)
+
 sum = sum * alpha + beta
-acc = acc * alpha + beta * value
+acc = acc * alpha + beta * v
+m = new_m
 ```
 
-At the end, `acc / sum` is written to output.
+At the end:
 
-## Tradeoffs
+```text
+out = acc / sum
+```
 
-This first version prioritizes clarity:
+This is numerically stable because scores are always exponentiated relative to the current maximum. It also lets the kernel stream through K/V once without storing the attention scores.
 
-- one block per query/head is simple and easy to inspect
-- the full K/V stream is read once
-- no attention matrix is materialized
-- head dimensions up to 256 are supported
-- very long contexts may underuse the GPU because a single block handles a whole sequence/head
+## Memory Access Pattern
 
-## Good Follow-Up Optimizations
+For a fixed `(batch, head)`, tokens are visited in logical order. The block table maps each logical block to a physical block in the cache:
 
-- Add vectorized loads for common dimensions such as 64, 128, and 256.
-- Split long contexts across multiple blocks, then reduce partial softmax states.
-- Add support for grouped-query attention where query heads share KV heads.
-- Add int8 or FP8 KV cache paths with per-block scales.
-- Benchmark memory bandwidth and achieved occupancy with Nsight Compute.
-- Add causal, prefix, and sliding-window mask variants.
-- Implement a small scheduler benchmark that simulates many mixed-length requests.
+```text
+k_cache[physical_block, head, block_offset, dim]
+v_cache[physical_block, head, block_offset, dim]
+```
+
+For each token, adjacent threads load adjacent feature dimensions, so the per-token K/V vector reads are contiguous along `head_dim`. The block-table lookup adds one level of indirection at block boundaries.
+
+## Current Kernel Scope
+
+- Dtypes: `float32`, `float16`, `bfloat16` through PyTorch dispatch.
+- Head dimension: up to 256.
+- Output: one decode token per `(batch, head)`.
+- Attention: full prefix attention over `seq_lens[b]` tokens.
+- Inputs: contiguous tensors.
+
+## Limitations
+
+- One CUDA block processes a full sequence/head, so very long contexts do not split work across multiple thread blocks.
+- The kernel prioritizes readability over vectorized memory instructions.
+- It does not implement grouped-query attention.
+- It does not implement int8/FP8 KV-cache quantization.
+- It does not include causal, sliding-window, or prefix-mask variants.
+
+## Next Steps
+
+- Add vectorized loads for head dimensions such as 64, 128, and 256.
+- Split long contexts across multiple blocks and reduce partial online-softmax states.
+- Add grouped-query attention support.
+- Add quantized KV-cache variants with per-block scales.
+- Add mask variants for sliding-window and prefix attention.
+- Add a scheduler benchmark with mixed sequence lengths.
 

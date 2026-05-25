@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 import statistics
 import sys
@@ -29,6 +30,7 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float16")
+    parser.add_argument("--format", choices=["text", "json", "markdown"], default="text")
     return parser.parse_args()
 
 
@@ -54,9 +56,7 @@ def measure(fn, warmup, iters, device):
 def main():
     args = parse_args()
     if args.device == "cuda" and not torch.cuda.is_available():
-        print("CUDA requested but unavailable; falling back to CPU smoke benchmark.")
-        args.device = "cpu"
-        args.dtype = "float32"
+        raise SystemExit("CUDA device requested but torch.cuda.is_available() is false.")
 
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
@@ -73,13 +73,19 @@ def main():
     actual = paged_attention(q, k_cache, v_cache, block_tables, seq_lens)
     max_error = (actual.float() - reference.float()).abs().max().item()
 
-    print("Flash Decode Paged Attention Benchmark")
-    print(f"device={device}, dtype={dtype}, extension={cuda_extension_available()}")
-    print(
-        f"batch={args.batch}, heads={args.heads}, seq_len={args.seq_len}, "
-        f"head_dim={args.dim}, block_size={args.block_size}"
-    )
-    print(f"max_error_vs_reference={max_error:.6g}")
+    result = {
+        "device": str(device),
+        "dtype": str(dtype).replace("torch.", ""),
+        "extension": cuda_extension_available(),
+        "batch": args.batch,
+        "heads": args.heads,
+        "seq_len": args.seq_len,
+        "head_dim": args.dim,
+        "block_size": args.block_size,
+        "max_error_vs_reference": max_error,
+        "cuda_kernel_ms": None,
+        "torch_reference_ms": None,
+    }
 
     if device.type == "cuda" and cuda_extension_available():
         mean_ms, median_ms, best_ms = measure(
@@ -88,7 +94,11 @@ def main():
             args.iters,
             device,
         )
-        print(f"cuda_kernel_ms mean={mean_ms:.3f} median={median_ms:.3f} best={best_ms:.3f}")
+        result["cuda_kernel_ms"] = {
+            "mean": mean_ms,
+            "median": median_ms,
+            "best": best_ms,
+        }
 
     mean_ms, median_ms, best_ms = measure(
         lambda: paged_attention_reference(q, k_cache, v_cache, block_tables, seq_lens),
@@ -96,7 +106,47 @@ def main():
         max(3, args.iters // 5),
         device,
     )
-    print(f"torch_reference_ms mean={mean_ms:.3f} median={median_ms:.3f} best={best_ms:.3f}")
+    result["torch_reference_ms"] = {
+        "mean": mean_ms,
+        "median": median_ms,
+        "best": best_ms,
+    }
+
+    if args.format == "json":
+        print(json.dumps(result, indent=2, sort_keys=True))
+    elif args.format == "markdown":
+        cuda_ms = result["cuda_kernel_ms"]
+        ref_ms = result["torch_reference_ms"]
+        cuda_cell = "-" if cuda_ms is None else f"{cuda_ms['median']:.3f}"
+        print(
+            "| device | dtype | B | H | S | D | block | extension | max error | CUDA median ms | reference median ms |"
+        )
+        print("|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|")
+        print(
+            f"| {result['device']} | {result['dtype']} | {result['batch']} | {result['heads']} | "
+            f"{result['seq_len']} | {result['head_dim']} | {result['block_size']} | "
+            f"{result['extension']} | {result['max_error_vs_reference']:.6g} | "
+            f"{cuda_cell} | {ref_ms['median']:.3f} |"
+        )
+    else:
+        print("Flash Decode Paged Attention Benchmark")
+        print(f"device={device}, dtype={dtype}, extension={cuda_extension_available()}")
+        print(
+            f"batch={args.batch}, heads={args.heads}, seq_len={args.seq_len}, "
+            f"head_dim={args.dim}, block_size={args.block_size}"
+        )
+        print(f"max_error_vs_reference={max_error:.6g}")
+        if result["cuda_kernel_ms"] is not None:
+            cuda_ms = result["cuda_kernel_ms"]
+            print(
+                "cuda_kernel_ms "
+                f"mean={cuda_ms['mean']:.3f} median={cuda_ms['median']:.3f} best={cuda_ms['best']:.3f}"
+            )
+        ref_ms = result["torch_reference_ms"]
+        print(
+            "torch_reference_ms "
+            f"mean={ref_ms['mean']:.3f} median={ref_ms['median']:.3f} best={ref_ms['best']:.3f}"
+        )
 
 
 if __name__ == "__main__":
